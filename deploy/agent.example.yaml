@@ -1,0 +1,30 @@
+# Copy to agent.yaml on the company PC (agent.yaml is git-ignored).
+# Secret/token are shown once when you register the computer in the admin page
+# (or set RELAY_AGENT_SECRET / RELAY_AGENT_TOKEN). Database credentials come from the
+# environment: HADOOP_USER_NAME and HADOOP_USER_PASSWORD.
+name: pc-example
+relay_url: https://relay.example.internal:8080
+secret: ""
+token: ""
+
+connections:          # real hosts live only here, on the PC
+  presto:
+    host: presto.example.internal
+    port: 8080
+    catalog: hive
+    session_props:
+      query_max_run_time: "30m"
+      query_max_execution_time: "30m"
+  hive:
+    host: hive.example.internal
+    port: 10000
+    auth: CUSTOM
+    configuration:
+      mapred.job.name: gateway_agent
+      mapred.job.queue.name: root.your_queue
+      hive.exec.dynamic.partition.mode: nonstrict
+
+datasets:             # only these can ever be run; the server sends just the name
+  sales:
+    driver: presto    # presto | hive
+    sql: "select id, amount, dt from db.sales where dt >= date_add('day', -30, current_date)"

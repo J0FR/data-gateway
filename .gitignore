@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# data-gateway
+*.db
+agent.yaml
+deploy/.env

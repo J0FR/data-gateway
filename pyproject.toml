@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data-gateway"
+version = "0.1.0"
+description = "Passive PC agent + relay service that moves data from company data sources to the dashboard server"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["fastapi", "uvicorn", "pyyaml", "requests", "pandas>=1.5", "sqlalchemy>=1.4.24"]
+
+[project.optional-dependencies]
+# company PC: Presto + Hive drivers (versions match the old didi99 package)
+agent = ["pyhive[hive_pure_sasl]==0.7.0"]
+# dashboard server
+server = ["apscheduler>=3.10,<4", "psycopg2-binary", "python-multipart"]
+test = ["httpx", "apscheduler>=3.10,<4", "python-multipart"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
