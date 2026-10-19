@@ -1,0 +1,19 @@
+# Linux server: systemd unit for the relay service.
+#   sudo cp deploy/relay.service /etc/systemd/system/data-gateway.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now data-gateway
+# Assumes: code in /opt/data-gateway with a virtualenv in .venv, settings in /etc/data-gateway/relay.env
+[Unit]
+Description=data-gateway relay service
+After=network.target postgresql.service
+
+[Service]
+User=relay
+WorkingDirectory=/opt/data-gateway
+EnvironmentFile=/etc/data-gateway/relay.env
+ExecStart=/opt/data-gateway/.venv/bin/python -m data_gateway.server
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
