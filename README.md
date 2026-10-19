@@ -16,21 +16,29 @@ Dashboard refresh button / daily schedule -> job queue -> dispatcher
 * **Management dashboard** at `/admin`: plain-language state summary, registered computers (online/busy/offline), jobs (retry/cancel), datasets (stale warning, run now, rollback), schedules (pause/resume).
 
 ## Run
-**Server (Docker, next to the dashboards' Postgres)**
-```
-cp deploy/.env.example deploy/.env      # fill RELAY_DATABASE_URL and RELAY_ADMIN_TOKEN
-docker compose -f deploy/docker-compose.yml up -d
-```
-Open `http://<server>:8080/admin` (user `admin`, password = admin token), create a dataset, then register the PC to get its secret and token (shown once).
+No Docker needed: plain Python (3.9+) in a virtualenv.
 
-**Agent (company PC)**
+**Server (next to the dashboards' Postgres)**
 ```
-pip install ".[agent]"
-copy deploy\agent.example.yaml agent.yaml    # fill name, relay_url, secret, token, connections, datasets
-set HADOOP_USER_NAME=...  &  set HADOOP_USER_PASSWORD=...
-python -m data_gateway.agent agent.yaml --port 8765
+python -m venv .venv
+.venv/bin/pip install ".[server]"                 # Windows: .venv\Scripts\pip install ".[server]"
+cp deploy/relay.env.example relay.env             # fill RELAY_DATABASE_URL and RELAY_ADMIN_TOKEN
 ```
-Allow only the server's IP through the PC firewall, and put a TLS reverse proxy in front of the server.
+* *Linux, always on:* edit paths in `deploy/relay.service`, copy it to `/etc/systemd/system/data-gateway.service`, put the env file at `/etc/data-gateway/relay.env`, then `sudo systemctl enable --now data-gateway`.
+* *Windows Server, always on:* `.\deploy\run.ps1 -Role server -EnvFile relay.env` (restarts on exit); run it at boot with Task Scheduler or NSSM.
+* *Quick test:* `set -a; . ./relay.env; set +a; .venv/bin/python -m data_gateway.server`
+
+Open `http://<server>:8080/admin` (user `admin`, password = admin token), create a dataset, then register the PC to get its secret and token (shown once). Keep `RELAY_HOST=127.0.0.1` and put a TLS reverse proxy (nginx/Caddy/IIS) in front, or accept plain HTTP only on a trusted network.
+
+**Agent (company PC, Windows)**
+```
+python -m venv .venv
+.venv\Scripts\pip install ".[agent]"
+copy deploy\agent.example.yaml agent.yaml         # fill name, relay_url, secret, token, connections, datasets
+# agent.env: HADOOP_USER_NAME=...  and  HADOOP_USER_PASSWORD=...   (one KEY=VALUE per line)
+.\deploy\install_agent_task.ps1 -InstallDir C:\data-gateway    # starts at logon, hidden, auto-restart
+```
+Manual run instead: `.venv\Scripts\python -m data_gateway.agent agent.yaml --port 8765`. Allow only the server's IP through the PC firewall for that port.
 
 **Dashboard refresh button:** `POST /api/refresh/<dataset>` with `Authorization: Bearer <RELAY_DASHBOARD_TOKEN>`, then poll `GET /api/jobs/<id>`.
 

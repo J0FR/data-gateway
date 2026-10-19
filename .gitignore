@@ -222,4 +222,5 @@ __marimo__/
 # data-gateway
 *.db
 agent.yaml
-deploy/.env
+*.env
+!*.env.example
