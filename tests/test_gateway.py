@@ -43,8 +43,8 @@ class FakeConnector:
     def __init__(self, df):
         self.df = df
 
-    def query(self, sql):
-        return self.df
+    def query(self, sql, max_rows=None):
+        return self.df if max_rows is None else self.df.head(max_rows)
 
 
 class SigningTests(unittest.TestCase):

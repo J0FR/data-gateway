@@ -15,6 +15,9 @@ Dashboard refresh button / daily schedule -> job queue -> dispatcher
 * `data_gateway.server` - FastAPI service: upload endpoint, job queue, dispatcher, scheduler (cron, UTC), health checks, safe loader with versions and rollback.
 * **Management dashboard** at `/admin`: plain-language state summary, registered computers (online/busy/offline), jobs (retry/cancel), datasets (stale warning, run now, rollback), schedules (pause/resume).
 
+* **SQL test page** at `/admin/sql`: an open-source SQL editor (CodeMirror 5, MIT, bundled locally so no internet is needed) with highlighting and autocomplete. Pick Presto or Hive, press Ctrl+Enter, and the service sends the query to an online agent, which runs it and returns the rows (table view, CSV download, recent history).
+  * **Read-only and opt-in.** The agent runs ad-hoc SQL only if its `agent.yaml` has `allow_adhoc_sql: true`. Only a single `SELECT` / `WITH` / `SHOW` / `DESCRIBE` / `EXPLAIN` statement is accepted (checked on the server and again on the agent), results are capped at `adhoc_max_rows` (default 10,000), nothing is written to the dataset tables, and every run is in the audit log.
+
 ## Run
 No Docker needed: plain Python (3.9+) in a virtualenv.
 

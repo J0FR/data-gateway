@@ -7,6 +7,11 @@ relay_url: https://relay.example.internal:8080
 secret: ""
 token: ""
 
+# SQL test page (/admin/sql): lets admins run single read-only queries on this PC.
+# Off by default. Even when on: SELECT/WITH/SHOW/DESCRIBE/EXPLAIN only, row-capped, audited.
+allow_adhoc_sql: false
+adhoc_max_rows: 10000
+
 connections:          # real hosts live only here, on the PC
   presto:
     host: presto.example.internal

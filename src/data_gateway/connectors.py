@@ -30,10 +30,11 @@ class PrestoConnector:
         connect_args = {"session_props": session_props} if session_props else {}
         self._engine = sa.create_engine(url, connect_args=connect_args)
 
-    def query(self, sql):
+    def query(self, sql, max_rows=None):
         with self._engine.connect() as conn:
             result = conn.exec_driver_sql(sql)
-            return pd.DataFrame(result.fetchall(), columns=list(result.keys()))
+            rows = result.fetchall() if max_rows is None else result.fetchmany(max_rows)
+            return pd.DataFrame(rows, columns=list(result.keys()))
 
 
 class HiveConnector:
@@ -48,11 +49,11 @@ class HiveConnector:
             configuration={k: str(v) for k, v in (configuration or {}).items()},
         )
 
-    def query(self, sql):
+    def query(self, sql, max_rows=None):
         cursor = self._conn.cursor()
         try:
             cursor.execute(sql)
-            rows = cursor.fetchall()
+            rows = cursor.fetchall() if max_rows is None else cursor.fetchmany(max_rows)
             columns = [c[0].split(".")[-1] for c in cursor.description]
         finally:
             cursor.close()

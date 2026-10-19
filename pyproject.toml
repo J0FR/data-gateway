@@ -19,3 +19,6 @@ test = ["httpx", "apscheduler>=3.10,<4", "python-multipart"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+data_gateway = ["server/static/**/*"]

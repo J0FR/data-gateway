@@ -1,11 +1,14 @@
 """Management dashboard (server-rendered HTML, auto-refreshing every 10s)."""
+import csv
 import html
+import io
+import json
 import secrets
 from urllib.parse import urlparse
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from ..common import utcnow
@@ -31,6 +34,87 @@ button{cursor:pointer;border:1px solid #c5cbd5;background:#fff;border-radius:5px
 input,select{padding:4px 6px;border:1px solid #c5cbd5;border-radius:5px}
 .msg{background:#fff7e0;border:1px solid #f0d98a;padding:8px 12px;border-radius:6px;margin-bottom:14px}
 code{background:#eef1f5;padding:1px 5px;border-radius:4px;word-break:break-all}
+nav{margin-top:6px}nav a{color:#9fc2ff;margin-right:14px;text-decoration:none}
+"""
+
+SQL_HEAD = """
+<link rel="stylesheet" href="/static/cm/codemirror.min.css">
+<link rel="stylesheet" href="/static/cm/addon/show-hint.min.css">
+<style>
+.sqlwrap{display:grid;grid-template-columns:1fr 260px;gap:18px}@media(max-width:900px){.sqlwrap{grid-template-columns:1fr}}
+.CodeMirror{height:240px;border:1px solid #c5cbd5;border-radius:6px;font-size:14px}
+#grid{overflow:auto;max-height:480px;border:1px solid #dde1e8;border-radius:6px}
+#grid table{min-width:100%}#grid th{position:sticky;top:0;background:#f0f2f6}
+#hist{list-style:none;padding:0;margin:0}#hist li{padding:6px 0;border-bottom:1px solid #eceff3}
+#hist a{color:#1c2330;text-decoration:none;word-break:break-word}
+.bar{display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap}
+button.primary{background:#2563eb;color:#fff;border-color:#2563eb;padding:5px 16px}
+#st{color:#5b6677}.err{color:#b42318;white-space:pre-wrap}
+</style>
+<script src="/static/cm/codemirror.min.js"></script>
+<script src="/static/cm/mode/sql.min.js"></script>
+<script src="/static/cm/addon/show-hint.min.js"></script>
+<script src="/static/cm/addon/sql-hint.min.js"></script>
+"""
+
+SQL_PAGE = """
+<div class="sqlwrap"><div>
+<section><h2>SQL test <small style="font-weight:normal;color:#5b6677">
+read-only (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN), first 10,000 rows, runs on a company PC</small></h2>
+<textarea id="sql">select 1</textarea>
+<div class="bar">
+ <select id="driver"><option value="presto">Presto</option><option value="hive">Hive</option></select>
+ <button class="primary" id="run">Run (Ctrl+Enter)</button>
+ <button id="cancel" disabled>Cancel</button>
+ <a id="csv" href="#" style="display:none">Download CSV</a>
+ <span id="st"></span>
+</div>
+<div id="msg" class="err"></div>
+<div id="grid"></div></section></div>
+<aside><section><h2>Recent</h2><ul id="hist">{{HISTORY}}</ul></section></aside></div>
+<script>
+const $=id=>document.getElementById(id), ta=$('sql');
+const ed=window.CodeMirror?CodeMirror.fromTextArea(ta,{mode:'text/x-sql',lineNumbers:true,
+ indentWithTabs:false,extraKeys:{'Ctrl-Enter':run,'Cmd-Enter':run,'Ctrl-Space':'autocomplete'},
+ hintOptions:{completeSingle:false}}):null;
+if(ed)ed.on('inputRead',(c,ch)=>{if(/[A-Za-z_.]/.test(ch.text[0]||''))c.showHint({completeSingle:false})});
+const getSql=()=>ed?ed.getValue():ta.value, setSql=v=>ed?ed.setValue(v):(ta.value=v);
+let cur=null,runningId=0;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function show(j){
+ $('msg').textContent='';const g=$('grid');g.textContent='';$('csv').style.display='none';
+ if(j.status!=='success'){$('msg').textContent=j.status==='cancelled'?'Cancelled.':(j.error||'');return}
+ const MAX=1000,t=document.createElement('table'),h=t.insertRow();
+ j.columns.forEach(c=>{const th=document.createElement('th');th.textContent=c;h.appendChild(th)});
+ j.rows.slice(0,MAX).forEach(r=>{const tr=t.insertRow();r.forEach(v=>{tr.insertCell().textContent=v===null?'NULL':String(v)})});
+ g.appendChild(t);
+ const more=j.rows.length>MAX?` (showing first ${MAX}; download CSV for all)`:'';
+ $('st').textContent=`${j.row_count} rows${j.truncated?' (capped at 10,000)':''} in ${j.elapsed}s${more}`;
+ $('csv').href=`/admin/sql/${j.id}/csv`;$('csv').style.display='inline';
+}
+async function run(){
+ if($('run').disabled)return;
+ $('run').disabled=true;$('cancel').disabled=false;$('msg').textContent='';$('st').textContent='Sending…';
+ $('grid').textContent='';$('csv').style.display='none';
+ try{
+  const r=await fetch('/admin/sql/run',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({driver:$('driver').value,sql:getSql()})});
+  const j=await r.json();
+  if(!r.ok){$('msg').textContent=j.detail||'Request failed';$('st').textContent='';return}
+  cur=j.id;
+  for(;;){
+   const s=await (await fetch('/admin/sql/'+cur)).json();
+   if(s.status==='pending'||s.status==='running'){$('st').textContent=`Running… ${s.elapsed}s`;await sleep(1000);continue}
+   $('st').textContent=s.status==='success'?'':s.status;show(s);break;
+  }
+ }catch(e){$('msg').textContent=String(e)}
+ finally{$('run').disabled=false;$('cancel').disabled=true;cur=null}
+}
+$('run').onclick=run;
+$('cancel').onclick=()=>{if(cur)fetch('/admin/sql/'+cur+'/cancel',{method:'POST'})};
+$('hist').onclick=e=>{const a=e.target.closest('a');if(!a)return;e.preventDefault();
+ setSql(a.dataset.sql);$('driver').value=a.dataset.driver};
+</script>
 """
 
 
@@ -70,13 +154,15 @@ def build_admin_router(ctx):
     def done(msg=""):
         return RedirectResponse(f"/admin?msg={esc(msg)}" if msg else "/admin", status_code=303)
 
-    def page(body, refresh=True):
+    def page(body, refresh=True, head=""):
         meta = '<meta http-equiv="refresh" content="10">' if refresh else ""
         return HTMLResponse(
             f'<!doctype html><html><head><meta charset="utf-8">{meta}'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f"<title>Relay admin</title><style>{CSS}</style></head><body>"
-            f'<header><h1>data-gateway · management</h1></header><main>{body}</main></body></html>'
+            f"<title>Relay admin</title><style>{CSS}</style>{head}</head><body>"
+            f'<header><h1>data-gateway · management</h1>'
+            f'<nav><a href="/admin">Overview</a> <a href="/admin/sql">SQL test</a></nav></header>'
+            f"<main>{body}</main></body></html>"
         )
 
     def summary(now, agents, jobs_active, failed24, datasets):
@@ -279,6 +365,69 @@ def build_admin_router(ctx):
             return done(str(exc))
         store.audit_log(user, "dataset.rollback", f"{name} -> v{v}")
         return done(f"{name} rolled back.")
+
+    # ----- SQL test page (read-only; runs on an agent that allows ad-hoc SQL) -----
+    @router.get("/sql", response_class=HTMLResponse)
+    def sql_page(user: str = Depends(admin)):
+        now = utcnow()
+        items = []
+        for x in svc.recent_adhoc(15):
+            first = " ".join(x["sql"].split())[:90]
+            items.append(
+                f"<li><a href='#' data-sql=\"{esc(x['sql'], quote=True)}\" data-driver='{esc(x['driver'])}'>"
+                f"{esc(first)}</a><br><small>{pill(x['status'])} {esc(x['driver'])} · "
+                f"{ago(x['created_at'], now)}"
+                f"{' · ' + str(x['row_count']) + ' rows' if x['row_count'] is not None else ''}"
+                f"</small></li>")
+        body = SQL_PAGE.replace("{{HISTORY}}", "".join(items) or "<li><small>No queries yet.</small></li>")
+        return page(body, refresh=False, head=SQL_HEAD)
+
+    @router.post("/sql/run")
+    async def sql_run(request: Request, user: str = Depends(admin)):
+        same_origin(request)
+        try:
+            data = await request.json()
+            qid = svc.submit_adhoc(user, str(data.get("driver", "")), str(data.get("sql", "")))
+        except ValueError as exc:  # also covers bad JSON and UnsafeSQL
+            raise HTTPException(400, str(exc))
+        return {"id": qid}
+
+    def _query_json(qid):
+        row = svc.adhoc_status(qid)
+        if not row:
+            raise HTTPException(404, "unknown query")
+        out = {"id": row["id"], "status": row["status"], "error": row["error"],
+               "driver": row["driver"], "row_count": row["row_count"],
+               "truncated": bool(row["truncated"]),
+               "elapsed": int(((row["finished_at"] or utcnow()) - (row["started_at"] or row["created_at"]))
+                              .total_seconds()),
+               "columns": [], "rows": []}
+        if row["status"] == "success" and row["result_json"]:
+            res = json.loads(row["result_json"])
+            out["columns"], out["rows"] = res["columns"], res["rows"]
+        return out
+
+    @router.get("/sql/{qid}")
+    def sql_status(qid: int, user: str = Depends(admin)):
+        return _query_json(qid)
+
+    @router.get("/sql/{qid}/csv")
+    def sql_csv(qid: int, user: str = Depends(admin)):
+        res = _query_json(qid)
+        if res["status"] != "success":
+            raise HTTPException(404, "no result")
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(res["columns"])
+        for r in res["rows"]:  # a leading = + - @ would run as a formula in Excel
+            w.writerow(["'" + c if isinstance(c, str) and c[:1] in "=+-@" else c for c in r])
+        return Response(buf.getvalue(), media_type="text/csv", headers={
+            "Content-Disposition": f"attachment; filename=query-{qid}.csv"})
+
+    @router.post("/sql/{qid}/cancel")
+    def sql_cancel(qid: int, request: Request, user: str = Depends(admin)):
+        same_origin(request)
+        return {"cancelled": svc.cancel_adhoc(user, qid)}
 
     @router.post("/schedules/{name}/{action}")
     def schedule_toggle(name: str, action: str, request: Request, user: str = Depends(admin)):

@@ -6,12 +6,15 @@ The agent never asks the server for work. It only answers:
 * ``POST /task``             - start a task ({"job_id", "dataset"}); 202, runs in background
 * ``GET  /task/{id}``        - task status
 * ``POST /task/{id}/cancel`` - cancel (result will be discarded)
+* ``GET  /task/{id}/result`` - rows of a finished ad-hoc query
 
 Every request must be signed with the shared secret (see ``common.sign_headers``).
-The agent only runs datasets listed in its local config, so the network can never
-inject SQL.
+The agent only runs datasets listed in its local config. The one exception is the
+SQL test page: if ``allow_adhoc_sql: true`` the agent also runs single read-only
+statements (see ``sqlguard``) with a row cap, and returns them without storing anything.
 """
 import gzip
+import json
 import logging
 import os
 import threading
@@ -24,6 +27,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 
 from ..common import HttpClient, SignatureError, Verifier
 from ..connectors import DRIVERS, build_connector
+from ..sqlguard import UnsafeSQL, check_read_only
 
 log = logging.getLogger("data_gateway.agent")
 
@@ -40,6 +44,8 @@ class AgentConfig:
     upload_retries: int = 3
     upload_timeout: int = 300
     connections: dict = field(default_factory=dict)  # driver -> host/port/... (see connectors.py)
+    allow_adhoc_sql: bool = False   # lets the relay's SQL test page run read-only queries here
+    adhoc_max_rows: int = 10000
 
 
 def load_config(path):
@@ -55,6 +61,8 @@ def load_config(path):
         upload_retries=raw.get("upload_retries", 3),
         upload_timeout=raw.get("upload_timeout", 300),
         connections=raw.get("connections", {}),
+        allow_adhoc_sql=bool(raw.get("allow_adhoc_sql", False)),
+        adhoc_max_rows=int(raw.get("adhoc_max_rows", 10000)),
     )
     if not cfg.secret or not cfg.token:
         raise ValueError("agent secret and token are required (config or env)")
@@ -86,11 +94,75 @@ class AgentService:
                 "busy": self._current is not None,
                 "current_task": self._current,
                 "datasets": sorted(self.config.datasets),
+                "adhoc": self.config.allow_adhoc_sql,
             }
 
     def task(self, task_id):
         with self._lock:
-            return dict(self._tasks[task_id]) if task_id in self._tasks else None
+            if task_id not in self._tasks:
+                return None
+            return {k: v for k, v in self._tasks[task_id].items() if k != "result"}
+
+    def result(self, task_id):
+        """Rows of a finished ad-hoc query, or None."""
+        with self._lock:
+            t = self._tasks.get(task_id)
+            return t.get("result") if t and t["state"] == "done" else None
+
+    def _prune(self):
+        """Keep memory bounded: remember only the 20 most recent tasks (lock held)."""
+        for old in list(self._tasks)[:-20]:
+            if self._tasks[old]["state"] != "running":
+                del self._tasks[old]
+
+    def start_adhoc(self, query_id, driver, sql, background=True):
+        """Run a read-only query for the relay's SQL test page. Returns (http_status, body)."""
+        if not self.config.allow_adhoc_sql:
+            return 403, {"error": "ad-hoc SQL is not enabled on this agent (allow_adhoc_sql)"}
+        if driver not in DRIVERS:
+            return 400, {"error": f"driver must be one of {DRIVERS}"}
+        try:
+            sql = check_read_only(sql)
+        except UnsafeSQL as exc:
+            return 400, {"error": str(exc)}
+        task_id = f"adhoc-{query_id}"
+        with self._lock:
+            if self._current is not None and self._current != task_id:
+                return 409, {"error": "agent busy", "current_task": self._current}
+            if task_id in self._tasks and self._tasks[task_id]["state"] == "running":
+                return 202, {"task_id": task_id}
+            self._prune()
+            self._tasks[task_id] = {
+                "task_id": task_id, "kind": "adhoc", "driver": driver, "sql": sql,
+                "state": "running", "error": None, "rows": None,
+            }
+            self._current = task_id
+        if background:
+            threading.Thread(target=self._run_adhoc, args=(task_id,), daemon=True).start()
+        else:
+            self._run_adhoc(task_id)
+        return 202, {"task_id": task_id}
+
+    def _run_adhoc(self, task_id):
+        with self._lock:
+            t = self._tasks[task_id]
+            driver, sql = t["driver"], t["sql"]
+        cap = self.config.adhoc_max_rows
+        try:
+            df = self._factory(driver).query(sql, max_rows=cap + 1)
+            truncated = len(df) > cap
+            df = df.head(cap)
+            result = {
+                "columns": [str(c) for c in df.columns],
+                "rows": json.loads(df.to_json(orient="values", date_format="iso")),
+                "truncated": truncated,
+            }
+            with self._lock:
+                self._tasks[task_id]["result"] = result
+            self._finish(task_id, "done", rows=len(df))
+        except Exception as exc:
+            log.exception("ad-hoc query %s failed", task_id)
+            self._finish(task_id, "failed", error=str(exc)[:500])
 
     # ----- control -----
     def start(self, job_id, dataset, background=True):
@@ -103,6 +175,7 @@ class AgentService:
                 return 409, {"error": "agent busy", "current_task": self._current}
             if task_id in self._tasks and self._tasks[task_id]["state"] == "running":
                 return 202, {"task_id": task_id}  # idempotent re-send
+            self._prune()
             self._tasks[task_id] = {
                 "task_id": task_id, "job_id": job_id, "dataset": dataset,
                 "state": "running", "error": None, "rows": None,
@@ -208,17 +281,25 @@ def create_app(service):
 
     @app.post("/task", status_code=202)
     async def post_task(request: Request, body: bytes = Depends(authenticated)):
-        import json
-
         try:
             data = json.loads(body or b"{}")
-            job_id, dataset = int(data["job_id"]), str(data["dataset"])
-        except (ValueError, KeyError, TypeError):
-            raise HTTPException(400, "body must be JSON with job_id and dataset")
-        status, payload = service.start(job_id, dataset)
+            if data.get("kind") == "adhoc":
+                status, payload = service.start_adhoc(
+                    int(data["query_id"]), str(data["driver"]), str(data["sql"]))
+            else:
+                status, payload = service.start(int(data["job_id"]), str(data["dataset"]))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise HTTPException(400, "body must be JSON with job_id and dataset (or kind=adhoc fields)")
         if status != 202:
             raise HTTPException(status, payload["error"])
         return payload
+
+    @app.get("/task/{task_id}/result")
+    async def get_result(task_id: str, _=Depends(authenticated)):
+        r = service.result(task_id)
+        if r is None:
+            raise HTTPException(404, "no result for this task")
+        return r
 
     @app.get("/task/{task_id}")
     async def get_task(task_id: str, _=Depends(authenticated)):

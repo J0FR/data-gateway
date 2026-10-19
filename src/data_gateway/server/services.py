@@ -8,12 +8,14 @@ import sqlalchemy as sa
 from apscheduler.triggers.cron import CronTrigger
 
 from ..common import HttpClient, sha256_hex, sign_headers, utcnow
+from ..sqlguard import check_read_only
 from .loader import NAME_RE
 
 log = logging.getLogger("data_gateway.server")
 
 ACTIVE = ("pending", "running")
 MAX_ATTEMPTS = 3
+ADHOC_TIMEOUT = timedelta(minutes=10)
 
 
 def hash_token(token):
@@ -243,6 +245,110 @@ class Services:
                 continue  # unreachable now; the timeout above will catch a dead agent
             if resp.status_code == 404:
                 self.fail_or_requeue(job, "agent lost the task (restarted?)")
+
+    # ===== ad-hoc SQL (the SQL test page) =====
+    def submit_adhoc(self, actor, driver, sql):
+        """Validate (read-only) and hand the query to an online agent that allows ad-hoc SQL.
+
+        Returns the query id; look at its status for success/failure. Raises ValueError for
+        a bad driver or a statement that is not a single read-only query.
+        """
+        if driver not in ("presto", "hive"):
+            raise ValueError("driver must be presto or hive")
+        sql = check_read_only(sql)  # UnsafeSQL is a ValueError
+        q, a = self.store.adhoc, self.store.agents
+        qid = self.store.insert(q, actor=actor, driver=driver, sql=sql, status="pending",
+                                created_at=utcnow())
+        self.store.audit_log(actor, "sql.run", f"#{qid} {driver}: {sql[:300]}")
+        self.store.execute(sa.update(q).where(q.c.id < qid - 50).values(result_json=None))
+        body = json.dumps({"kind": "adhoc", "query_id": qid, "driver": driver, "sql": sql}).encode()
+        reason = "no online computer has ad-hoc SQL enabled (allow_adhoc_sql in its agent.yaml)"
+        for agent in self.store.rows(sa.select(a).where(a.c.enabled.is_(True)).order_by(
+                a.c.last_seen.desc())):
+            info = self.ping(agent)
+            if info is None or not info.get("adhoc"):
+                continue
+            if info.get("busy"):
+                reason = f"{agent['name']} is busy with another task; try again in a moment"
+                continue
+            try:
+                resp = self._call(agent, "POST", "/task", body)
+            except Exception as exc:
+                reason = f"could not reach {agent['name']}: {exc}"
+                continue
+            if resp.status_code == 202:
+                self.store.execute(sa.update(q).where(q.c.id == qid).values(
+                    status="running", agent_id=agent["id"], started_at=utcnow()))
+                return qid
+            try:
+                reason = f"{agent['name']}: {resp.json().get('detail')}"
+            except Exception:
+                reason = f"{agent['name']}: HTTP {resp.status_code}"
+        self._finish_adhoc(qid, "failed", reason)
+        return qid
+
+    def _finish_adhoc(self, qid, status, error=None, **values):
+        q = self.store.adhoc
+        self.store.execute(sa.update(q).where(q.c.id == qid, q.c.status.in_(ACTIVE)).values(
+            status=status, error=error, finished_at=utcnow(), **values))
+
+    def adhoc_status(self, qid):
+        """The query row; a running query is first refreshed from its agent."""
+        q = self.store.adhoc
+        row = self.store.row(sa.select(q).where(q.c.id == qid))
+        if row and row["status"] == "running":
+            self._refresh_adhoc(row)
+            row = self.store.row(sa.select(q).where(q.c.id == qid))
+        return row
+
+    def _refresh_adhoc(self, row):
+        qid = row["id"]
+        if row["started_at"] and utcnow() - row["started_at"] > ADHOC_TIMEOUT:
+            return self._finish_adhoc(qid, "failed", "timed out after 10 minutes")
+        a = self.store.agents
+        agent = self.store.row(sa.select(a).where(a.c.id == row["agent_id"]))
+        if not agent:
+            return self._finish_adhoc(qid, "failed", "agent was removed")
+        try:
+            resp = self._call(agent, "GET", f"/task/adhoc-{qid}")
+        except Exception:
+            return  # unreachable right now; the timeout above catches a dead agent
+        if resp.status_code == 404:
+            return self._finish_adhoc(qid, "failed", "agent lost the query (restarted?)")
+        if resp.status_code != 200:
+            return
+        task = resp.json()
+        if task["state"] == "failed":
+            self._finish_adhoc(qid, "failed", task.get("error") or "query failed")
+        elif task["state"] == "cancelled":
+            self._finish_adhoc(qid, "cancelled", "cancelled")
+        elif task["state"] == "done":
+            res = self._call(agent, "GET", f"/task/adhoc-{qid}/result")
+            if res.status_code == 200:
+                data = res.json()
+                self._finish_adhoc(qid, "success", None, row_count=len(data["rows"]),
+                                   truncated=bool(data.get("truncated")),
+                                   result_json=json.dumps(data))
+
+    def cancel_adhoc(self, actor, qid):
+        q, a = self.store.adhoc, self.store.agents
+        row = self.store.row(sa.select(q).where(q.c.id == qid))
+        if not row or row["status"] not in ACTIVE:
+            return False
+        agent = self.store.row(sa.select(a).where(a.c.id == row["agent_id"])) if row["agent_id"] else None
+        if agent:
+            try:
+                self._call(agent, "POST", f"/task/adhoc-{qid}/cancel")
+            except Exception:
+                pass
+        self._finish_adhoc(qid, "cancelled", f"cancelled by {actor}")
+        self.store.audit_log(actor, "sql.cancel", qid)
+        return True
+
+    def recent_adhoc(self, limit=15):
+        q = self.store.adhoc
+        cols = [c for c in q.c if c.name != "result_json"]
+        return self.store.rows(sa.select(*cols).order_by(q.c.id.desc()).limit(limit))
 
     # ===== status for dashboards =====
     def dataset_status(self, now=None):

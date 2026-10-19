@@ -89,6 +89,23 @@ class Store:
             C("detail", sa.Text),
         )
 
+        self.adhoc = T(
+            "adhoc_queries", md,
+            C("id", sa.Integer, primary_key=True, autoincrement=True),
+            C("actor", sa.String(80)),
+            C("driver", sa.String(20), nullable=False),
+            C("sql", sa.Text, nullable=False),
+            C("status", sa.String(20), nullable=False),  # pending|running|success|failed|cancelled
+            C("agent_id", sa.Integer),
+            C("created_at", sa.DateTime, nullable=False, default=utcnow),
+            C("started_at", sa.DateTime),
+            C("finished_at", sa.DateTime),
+            C("error", sa.Text),
+            C("row_count", sa.Integer),
+            C("truncated", sa.Boolean),
+            C("result_json", sa.Text),
+        )
+
     def create_all(self):
         with self.engine.begin() as conn:
             if self.schema:

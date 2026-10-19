@@ -8,6 +8,7 @@ import sqlalchemy as sa
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 
 from . import loader
 from .db import Store
@@ -63,6 +64,9 @@ def create_app(settings=None, http=None, start_scheduler=True):
 
     app = FastAPI(title="data-gateway", docs_url=None, redoc_url=None)
     app.state.ctx = ctx
+    # bundled CodeMirror (MIT) for the SQL test page; served locally so no internet is needed
+    app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+              name="static")
 
     def is_admin(token):
         return bool(token) and secrets.compare_digest(token, settings.admin_token)
